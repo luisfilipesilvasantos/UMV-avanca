@@ -1,0 +1,21 @@
+LIBRARY UMC
+EXPORTS
+    UMC_Init
+    UMC_Destroy
+    UMC_GetGpuDeviceCount
+    UMC_GetGpuDeviceInfo
+    UMC_GetTotalVirtualCapacity
+    UMC_GetTotalHostRam
+    UMC_GetAvailableHostRam
+    UMC_GetTotalPagefile
+    UMC_GetAvailablePagefile
+    UMC_WriteBlock
+    UMC_ReadBlock
+    UMC_GetBlockLocation
+    UMC_MigrateBlockToTier
+    UMC_RegisterAccess
+    UMC_IsThrashingDetected
+    umc_alloc
+    umc_free
+    umc_init_allocator
+    umc_cleanup_allocator
