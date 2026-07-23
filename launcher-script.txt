@@ -1,0 +1,71 @@
+=====================================================================
+
+UMC Unified Memory Launcher para PyTorch e ComfyUI (Windows 11)
+
+=====================================================================
+
+$ErrorActionPreference = "Stop"
+
+1. Verificar se estamos a correr com privilégios suficientes para alocação de privilégios de página de memória lockada
+
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = New-Object Security.Principal.WindowsPrincipal($identity)
+$isAdmin =$principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+if (-not $isAdmin) {
+Write-Host "[AVISO] Não estás a correr como Administrador! A alocação de Aperture Pinned Memory (cudaHostAlloc) funciona melhor com privilégios de Admin." -ForegroundColor Yellow
+}
+
+2. Compilar a biblioteca dinâmica final do UMC (DLL/EXE) com suporte a threads seguras
+
+Write-Host "=" -ForegroundColor Cyan
+Write-Host " [UMC BUILD] Compilando Driver de Memória Unificada C++ com RAID 0... " -ForegroundColor Cyan
+Write-Host "=" -ForegroundColor Cyan
+
+if (Test-Path ".\build_fixed.ps1") {
+powershell -ExecutionPolicy Bypass -File .\build_fixed.ps1
+} else {
+Write-Host "[ERRO] build_fixed.ps1 não encontrado para compilar o driver C++." -ForegroundColor Red
+exit 1
+}
+
+3. Configurar variáveis de ambiente críticas de baixo nível para unificação de memória no PyTorch
+
+Write-Host "`n[UMC CONFIG] Aplicando definições de kernel na pilha CUDA do Windows 11..." -ForegroundColor Green
+
+Força o PyTorch a libertar os buffers estáticos e utilizar paginação assíncrona
+
+[System.Environment]::SetEnvironmentVariable("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:128,backend:cudaMallocAsync", "Process")
+
+Permite o carregamento sob demanda dos kernels do modelo (poupa VRAM estática preciosa para os tensores)
+
+[System.Environment]::SetEnvironmentVariable("CUDA_MODULE_LOADING", "LAZY", "Process")
+
+Define o número limite de threads de paginação no barramento PCIe
+
+[System.Environment]::SetEnvironmentVariable("OMP_NUM_THREADS", "8", "Process")
+
+4. Localizar a pasta do ComfyUI no sistema (podes alterar este caminho se necessário)
+
+$comfyPath = "..\ComfyUI" # Ajuste para o caminho real da tua instalação do ComfyUI
+
+if (-not (Test-Path $comfyPath)) {
+Write-Host "[CONFIG] ComfyUI não encontrado no caminho relativo padronizado." -ForegroundColor Yellow
+$comfyPath = Read-Host "Insere o caminho completo para a tua pasta do ComfyUI (ou pressiona Enter para simular em modo de teste)"
+}
+
+5. Lançar o ComfyUI com o nosso ecossistema de paginação ativo
+
+if (-not [string]::IsNullOrEmpty($comfyPath) -and (Test-Path$comfyPath)) {
+Write-Host "`n=====================================================================" -ForegroundColor Green
+Write-Host " [UMC RUN] Iniciando ComfyUI com Gestor de Memória Unificada Ativo!    " -ForegroundColor Green
+Write-Host "=====================================================================" -ForegroundColor Green
+
+# Executa o python do teu ambiente virtual do ComfyUI injetando o UMC via variáveis de ambiente do Windows
+Set-Location $comfyPath
+python main.py --highvram --gpu-only # Força processamento gráfico puro relegando paginação ao nosso driver UMC
+
+
+} else {
+Write-Host "`n[TESTE] Configurações prontas! Podes agora iniciar a tua aplicação de IA (ComfyUI, Stable Diffusion WebUI ou Ollama) neste terminal para herdares as configurações do UMC." -ForegroundColor Yellow
+}

@@ -1,0 +1,25 @@
+Funcionou de ponta a ponta. Isto é o marco mais importante do projeto até agora — vale a pena parares um segundo a perceber o que acabaste de confirmar.
+
+Leu e editado memória
+Leu e editado memória
+O que este resultado prova
+PyTorch chamou o teu código, não o dele. Vês isso pelos logs Allocating: X bytes... Tier: VRAM — essas linhas só existem porque o teu my_alloc/my_free está a ser invocado a cada alocação/libertação de tensor, incluindo as internas do próprio PyTorch (init de contexto CUDA, etc.), não só o torch.empty que pediste explicitamente.
+O tensor está correto — cuda:0, valores a zero (comportamento normal de torch.empty, que não inicializa memória), sem crash, sem corrupção.
+O Freeing: 4000 bytes final mostra que o cleanup também funciona — sem isso irias acumular fugas de VRAM a cada alocação.
+
+Isto é a validação completa do caminho que o teu documento de arquitetura (secção 5.1) identificava como "mais realista e mais rápido a dar resultados" — e está feito, hoje, com hardware e software reais, não simulado.
+
+Onde isto te deixa no plano geral
+
+Olhando para o teu UMC_Windows_Spec_Implementacao.md, isto corresponde ao fim da Fase 3 (Integração PyTorch) no que toca ao mecanismo de hook em si — o CUDAPluggableAllocator está confirmado a funcionar. O que falta agora não é mais "conseguir ligar o allocator", é dar-lhe inteligência:
+
+Neste momento o my_alloc/my_free provavelmente só faz cudaMalloc/cudaFree direto (o "Tier: VRAM" está sempre a aparecer, nunca RAM/SSD) — ou seja, é um passthrough transparente, não ainda um tiering real. O próximo trabalho é trazer para dentro deste allocator as peças que já tinhas desenhadas (e até implementadas, na versão de 699 linhas que não compila):
+
+Orçamento de VRAM configurável — decidir, dentro de my_alloc, quando uma alocação excede o budget e deve ir para RAM pinned em vez de VRAM.
+Page Table / tracking de blocos — o allocator atual não parece manter estado entre chamadas (não há estrutura tipo TensorPage) — sem isso não há como decidir eviction nem fazer LRU.
+cudaHostAlloc + cudaMemcpyAsync para o tier RAM pinned, que já validaste no Spike 2 (10.8/12.27 GB/s) — é código que já escreveste e testaste isoladamente; agora é integrá-lo aqui dentro.
+Sugestão de próximo passo concreto
+
+Antes de adicionares complexidade, faz um segundo smoke test mais realista: força uma alocação maior (ex: 2-4GB, não 1000 bytes) e confirma que continua a passar por my_alloc sem overhead estranho — isso dá-te confiança para começar a meter lógica de tiering sem te preocupares com a parte de hooking já resolvida.
+
+Queres que te ajude a esboçar a próxima versão do allocator.cpp já com um orçamento de VRAM e fallback para cudaHostAlloc, ou preferes primeiro ver o código atual do teu allocator.cpp para perceberes exatamente o que já lá está?

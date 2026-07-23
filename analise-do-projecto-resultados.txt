@@ -1,0 +1,22 @@
+o que conseguiste é diferente do que a Apple faz, embora resolva um problema parecido.
+
+A diferença fundamental
+
+A "memória unificada" da Apple (UMA, nos Apple Silicon) é uma solução de hardware: CPU e GPU estão no mesmo chip (SoC) e partilham fisicamente os mesmos módulos de RAM. Não há duas memórias separadas com uma "ponte" entre elas — é literalmente a mesma memória física, acedida sem cópia (zero-copy) por ambos os processadores. Por isso o Mac não tem "VRAM" separada: tudo é RAM, ponto final.
+
+O teu UMC é outra coisa: a GPU (RTX 3060) continua a ter 12GB de VRAM fisicamente separados da RAM do sistema, ligados por PCIe. O que o UMC faz é gerir essa separação de forma inteligente — um sistema de tiering/paging explícito: VRAM (tier 0) → RAM pinned (tier 1) → SSD (tier 2), com cópias ativas entre eles via cudaMemcpyAsync.
+
+O que os teus próprios benchmarks confirmam
+
+Isto até já está documentado nos teus resultados da Fase 0:
+
+Spike 1 testou exatamente o caminho mais próximo da ideia da Apple — cudaMallocManaged com migração automática de página (o equivalente CUDA à filosofia UMA). Resultado: falhou (invalid device ordinal, concurrentManagedAccess = NAO). No Windows/WDDM, com esta GPU, isso não está disponível.
+Spike 2 confirmou que o caminho que funciona é cópia explícita pinned→VRAM, a 10.8 GB/s H2D / 12.27 GB/s D2H. Ou seja, há sempre uma transferência real de dados a acontecer, com custo de tempo mensurável (~1.85s para mover 20GB) — não é acesso instantâneo à mesma memória.
+
+Isso é a diferença que interessa: na Apple não há "mover dados de um sítio para outro", porque só há um sítio. No teu sistema há sempre uma cópia física através do barramento PCIe.
+
+O que realmente construíste
+
+Um sistema de paginação/swapping inteligente para IA — muito mais parecido com memória virtual do SO (RAM↔disco) ou com o que o llama.cpp faz com mmap, do que com UMA da Apple. É um objetivo genuinamente útil e bem mais realista em Windows: deixa correr modelos maiores que os 12GB de VRAM sem OOM, à custa de alguma latência — exatamente o que o teu documento de riscos (secção 7) já assume corretamente.
+
+Se quiseres, o termo mais correto para descrever o projeto (evitando confusão com a Apple) é algo como "virtual memory tiering para GPU" ou "explicit memory paging system", não "unified memory" — esse termo já está associado tanto ao UMA da Apple como ao cudaMallocManaged da NVIDIA, e os teus próprios testes mostram que o segundo não funciona no teu hardware/SO.

@@ -1,0 +1,24 @@
+Nome                                        ID                           Versão  Correspondência       Origem
+--------------------------------------------------------------------------------------------------------------
+Cursor                                      Anysphere.Cursor             3.10.11                       winget
+Harnest                                     AlexGladkov.Harnest          0.11.0  Tag: cursor           winget
+Custom Cursor                               BLife.CustomCursor           1.0.25  Tag: cursor           winget
+IDEAgentHub                                 IDEAgentHub.AgentHub         1.0.2   Tag: cursor           winget
+水豚鼠标助手                                Kapibala.Shuitun             2.2.7   Tag: cursor           winget
+OpenTokenUsage                              PowerUserZ.OpenTokenUsage    0.6.28  Tag: cursor           winget
+DevPod                                      Skvetter.DevPod              0.22.0  Tag: cursor           winget
+MCP Desktop                                 Vinkius.MCPDesktop           0.1.0   Tag: cursor           winget
+鼠标/触控板全局手势                         ZhaoKeli.FastGestures        2.2.72  Tag: cursor           winget
+InputTip                                    abgox.InputTip               3.6.9   Tag: cursor           winget
+Omni Skills                                 moatazhamada.omni-skills     1.5.6   Tag: cursor           winget
+oc-claw                                     rainnoon.OC-Claw             1.8.6   Tag: cursor           winget
+Clawd on Desk                               rullerzhou-afk.clawd-on-desk 0.11.0  Tag: cursor           winget
+Axialis CursorWorkshop                      Axialis.CursorWorkshop       6.33                          winget
+Custom Cursor                               XPFF8Q4ZP7Q321               Unknown                       msstore
+Custom Cute Cursors - Desktop Customization 9NX9CG96NR3B                 Unknown                       msstore
+Best Cursors - Custom Cursor for Windows    XP89GCWSKQJNRP               Unknown                       msstore
+Custom Cursor for Windows by Cute Cursors   XP8K43JX54F7FL               Unknown                       msstore
+Mouse Cursor Color Picker                   XPDFC5BQ2405G2               Unknown                       msstore
+Custom Cursor Pro - CUR Converter           9NC1P8QLH002                 Unknown                       msstore
+WinPaletter                                 Abdelrhman-AK.WinPaletter    1.0.9.8 Tag: cursors          winget
+MonMouse                                    melon-masou.MonMouse         0.2.0   Tag: multiple-cursors winget

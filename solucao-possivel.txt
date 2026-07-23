@@ -1,0 +1,22 @@
+Sim, para o teu caso de uso principal — mas com um "qualquer app" que precisa de ser bem definido, porque não é literalmente qualquer coisa. Vale a pena seres preciso aqui, porque é fácil a intuição escorregar de novo para "solução universal tipo Apple".
+
+O que já está provado que funciona
+
+Qualquer aplicação que use PyTorch por baixo — e que actives o CUDAPluggableAllocator antes de inicializar CUDA — passa a usar o teu allocator para todas as alocações de tensores. Isso cobre:
+
+ComfyUI (é PyTorch por baixo — é literalmente o teu caso de uso alvo)
+Qualquer script Python que use torch.cuda
+Praticamente todo o ecossistema de IA generativa hoje (Stable Diffusion, LLMs via transformers, etc.) — porque quase tudo assenta em PyTorch
+
+Isto já validaste ontem. Para este universo, sim: com a lógica de tiering implementada dentro do my_alloc (que ainda falta — hoje é passthrough direto para cudaMalloc), consegues carregar um modelo maior que os 12GB de VRAM sem OOM, exatamente como o teu documento de arquitetura descreve.
+
+Onde "qualquer app" deixa de ser verdade
+
+Três limites reais, não contornáveis pelo caminho que escolheste:
+
+Apps que não passam pelo PyTorch — llama.cpp compilado standalone, ou qualquer programa que chame cudaMalloc diretamente sem passar pela camada de alocador do PyTorch, não vê o teu allocator. Para esses precisarias de outra integração por app (é literalmente a secção 5.2 do teu documento — ggml-backend-umc.c para llama.cpp — trabalho separado, não vem de graça com o que já fizeste).
+expandable_segments:True — já identificaste isto tu próprio no diário: se essa flag do PyTorch estiver ativa, o caminho de alocação muda e ignora o allocator plugável. Precisa de estar desligada para o teu hook funcionar.
+Qualquer coisa fora de CUDA/GPU compute genérico — o teu allocator intercepta alocação de memória de dados de trabalho (tensores), não gráficos/rendering da GPU. Isso nunca foi o alvo, só a esclarecer.
+A resposta direta à tua pergunta
+
+Não é "reforçar o que o Windows já faz mas mal" — é substituir esse caminho, mas só dentro do universo PyTorch/CUDA, que por acaso é exatamente onde vives (ComfyUI). Não é uma solução ao nível do sistema operativo tipo Apple (isso exigiria driver kernel, já descartado), é uma solução ao nível da aplicação — mais restrita em alcance, mas suficiente para o problema real que tens: carregar modelos de 20-30GB numa RTX 3060 de 12GB dentro do ComfyUI.

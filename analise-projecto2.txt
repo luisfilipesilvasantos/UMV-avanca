@@ -1,0 +1,19 @@
+É uma boa intuição, e tens razão numa parte importante — mas a conclusão final ("não é possível, seria só reforçar o que o Windows já faz mas mal") não é exatamente o que está a acontecer no teu projeto. Vale a pena separar as duas coisas.
+
+A parte em que tens razão
+
+O Windows/WDDM já tem, de facto, um mecanismo automático de paginação de memória de GPU — é o que o Gestor de Tarefas mostra como "Shared GPU memory": quando uma aplicação pede mais VRAM do que existe fisicamente, o VidMm (Video Memory Manager, dentro do driver kernel-mode) pode mover alocações para RAM do sistema automaticamente. Isto já existe, já corre hoje, e é exatamente o "mas mal" a que te referes — é opaco, não sabe nada sobre o teu workload (que camada do modelo vem a seguir, que tensor é crítico agora), e por isso evicta/prefetch de forma genérica e lenta.
+
+E não, não dá para "reforçar" esse mecanismo específico a partir de um .exe/DLL em user-mode. Isso exigiria escrever um driver kernel-mode (WDDM KMD ou filter driver) — assinatura de driver pela Microsoft, acesso a estruturas internas do VidMm que a NVIDIA não documenta publicamente, e risco real de BSOD. É uma escala de projeto completamente diferente, e é essencialmente o que o teu próprio Spike 1 já confirmou como inviável (concurrentManagedAccess = NAO, pageableMemoryAccess = NAO) — o Windows não te dá o gancho de baixo nível que precisarias para influenciar essa decisão automática do driver.
+
+Onde a tua conclusão precisa de ajuste
+
+O que o teu allocator_cu126.dll já provou ontem não é "reforçar o mecanismo automático do Windows" — é o oposto: substitui-lo completamente, para as alocações CUDA especificamente. O CUDAPluggableAllocator intercepta o pedido de memória antes de ele sequer chegar ao caminho normal onde o WDDM decidiria (mal) o que fazer. O PyTorch já não pede memória ao driver da forma standard — pede ao teu my_alloc, e és tu que decides.
+
+Ou seja: não estás a tentar tornar o mecanismo automático do Windows mais inteligente (isso é inacessível sem driver kernel). Estás a contornar esse mecanismo inteiro e a tomar as decisões tu mesmo, ao nível da aplicação — que é precisamente porque isto é viável sem driver e o outro caminho não é.
+
+Quanto à "sincronia de dados como a Apple faz"
+
+Aqui há uma imprecisão a esclarecer: nem o mecanismo automático do Windows nem o teu allocator correm risco de perder sincronia/corromper dados — isso é sempre garantido, tanto pelo WDDM como pelo teu próprio código (desde que uses cudaMemcpyAsync com sincronização correta, como já está no teu plano). O que se perde não é correção, é velocidade e previsibilidade — cada transferência entre tiers custa tempo real (os teus 10.8/12.27 GB/s medidos), porque há sempre uma cópia física a acontecer.
+
+A Apple não tem esse custo porque não há cópia nenhuma — é a mesma memória física vista por CPU e GPU. Isso é hardware, não hoje replicável em PCIe discreto. O teu objetivo realista nunca foi igualar isso — é ser mais inteligente e mais rápido do que a paginação automática e opaca do Windows, ao nível da aplicação, coisa que já confirmaste tecnicamente possível e a funcionar.

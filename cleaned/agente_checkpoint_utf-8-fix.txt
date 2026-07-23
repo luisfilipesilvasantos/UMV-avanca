@@ -1,0 +1,22 @@
+=== AGENTE CHECKPOINT - INTERRUPÇÃO DE LOOP ===
+Data/Hora: 2026-07-16 17:24:47
+Pedido original: Olá! Vamos retomar o projeto UMC na pasta atual (UMC-avanca). Ignora qualquer histórico anterior e não corras comandos de leitura ou pesquisa (Get-Content, Select-String, etc.). Passa diretamente à alteração dos ficheiros seguindo estes passos exatos:
+
+Corrige o Mutex (Evitar Deadlock):
+Abre o VirtualGpuMemory.h e altera a linha std::mutex m_mutex; para std::recursive_mutex m_mutex;. (Garante que a biblioteca <recursive_mutex> está incluída no topo).
+
+Corrige o Stack Overflow (Evitar Crash):
+Abre o umc_no_cuda.cpp e substitui os buffers gigantes estáticos char buffer[4 * 1024 * 1024] e char readBuffer[4 * 1024 * 1024] por alocação dinâmica na heap usando:
+std::vector<char> buffer(4 * 1024 * 1024);
+std::vector<char> readBuffer(4 * 1024 * 1024);
+(Ajusta as chamadas de funções seguintes para usar .data(), ex: buffer.data()).
+
+Compila e Executa:
+Usa o CMake na pasta build para compilar o projeto em modo Release (cmake --build . --config Release) e corre o executável umc_no_cuda.exe para validar os testes.
+
+Regra de Ouro: Não faças perguntas nem procures por mais linhas de código. Aplica estas três alterações diretamente nas tuas próximas ações consecutivas e reporta o resultado do teste.
+Última ação que causou o loop: {
+  "action": "read_file",
+  "path": "VirtualGpuMemory.cpp"
+}
+Nota para o agente: O teu histórico de chat foi resetado porque estavas preso num loop infinito nesta ação. Analisa a pasta de trabalho, verifica os ficheiros modificados e muda de estratégia para concluir a tarefa com sucesso!

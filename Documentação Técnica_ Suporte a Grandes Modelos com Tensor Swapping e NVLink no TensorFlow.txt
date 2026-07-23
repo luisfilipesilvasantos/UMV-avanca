@@ -1,0 +1,53 @@
+﻿Documentação Técnica: Suporte a Grandes Modelos com Tensor Swapping e NVLink no TensorFlow
+Autor: Sam Matzek (IBM) Objetivo: Superar limitações de memória da GPU durante o treinamento de redes neurais profundas através de técnicas de Tensor Swapping (troca de tensores) e conectividade de alta velocidade (NVLink).
+1. O Problema: Restrições de Memória em Deep Learning
+Redes neurais estão se tornando mais profundas e largas, e o tamanho/volume dos dados de entrada está em constante crescimento, o que gera restrições críticas na memória limitada das GPUs.
+* Componentes de Memória na GPU:
+   * Dados de Entrada (Input data)
+   * Tensores (Saídas das camadas - Layer outputs)
+   * Kernels
+   * Valor da Perda (Loss)
+2. A Solução: Tensor Swapping (Large Model Support - LMS)
+A técnica consiste em mover tensores da memória da GPU para a memória do sistema (CPU) e vice-versa, conforme necessário durante o treinamento, permitindo lidar com modelos que excederiam a capacidade da VRAM.
+* Mecanismo:
+   * Swap out: Move tensores da memória GPU para a memória do sistema (CPU).
+   * Swap in: Move tensores de volta da memória do sistema para a memória da GPU para processamento.
+* Modificações no Grafo do TensorFlow: O framework insere automaticamente operações de "Swap out" e "Swap in" entre as camadas (A e B) para gerenciar o fluxo de tensores de forma transparente.
+3. Implementação (API do TensorFlow)
+O uso é simplificado através da biblioteca tensorflow_large_model_support.
+Exemplo com Keras:
+Python
+from tensorflow_large_model_support import LMS
+lms = LMS()
+lms.batch_size = 1
+# Adicionar lms como callback no fit_generator
+model.fit_generator(generator=training_gen, callbacks=[lms])
+
+
+Exemplo com Estimator:
+Python
+from tensorflow_large_model_support import LMS
+lms = LMS()
+# Adicionar lms como hook no train
+mnist_classifier.train(input_fn=train_input_fn, steps=20000, hooks=[logging_hook, lms])
+
+
+4. Impacto da Conectividade (NVLink 2.0 vs PCIe)
+A técnica de swapping é frequentemente considerada lenta devido à largura de banda. A solução proposta utiliza a arquitetura POWER9 com NVLink 2.0 para minimizar esse gargalo.
+* Comparativo de Largura de Banda:
+   * Conexão Típica (PCIe): 32 GB/s
+   * POWER9 (NVLink 2.0): 150 GB/s (entre GPU-GPU e CPU-GPU)
+* Resultados de Desempenho:
+   * A utilização de NVLink 2.0 reduz drasticamente o tempo por época em comparação com servidores baseados apenas em PCIe.
+   * O uso de NVLink 2.0 permite maior throughput de cópia de memória e maior utilização da GPU.
+   * Em testes de Multi-GPU, o sistema com NVLink 2.0 foi 2.1x mais rápido utilizando metade do número de GPUs em comparação a um servidor com PCIe.
+5. Resultados e Estudos de Caso
+O suporte a grandes modelos (TFLMS v2.0.0) permite:
+* 10x mais resolução de imagem em Keras ResNet50 e DeepLabV3.
+* 5x mais resolução de MRI em modelos 3D U-Net.
+* Vantagem do Treinamento com Imagem Inteira: Treinar com a imagem inteira (usando LMS) em vez de usar patches (recortes) mostrou-se 3x mais rápido em tempo por época e 3.5x mais rápido no tempo total de treinamento.
+6. Referências Técnicas
+* TFLMS (Repositório): https://github.com/IBM/tensorflow-large-model-support
+* Artigo Científico (LMS): "TFLMS: Large Model Support in TensorFlow by Graph Rewriting" (https://arxiv.org/pdf/1807.02037.pdf)
+* Artigo Científico (3D Medical Image): "Fast and Accurate 3D Medical Image Segmentation with Data-swapping Method" (https://arxiv.org/abs/1812.07816)
+* Hardware (IBM AC922): POWER9 com NVLink 2.0.

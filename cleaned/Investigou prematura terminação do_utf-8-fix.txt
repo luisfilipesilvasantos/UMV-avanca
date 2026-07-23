@@ -1,0 +1,94 @@
+Investigou prematura terminação do programa e necessidade de examinar código-fonte
+Investigou prematura terminação do programa e necessidade de examinar código-fonte
+Ah, isto esclarece tudo — o programa não crasha nem trava, ele simplesmente acaba a correr depois de imprimir "Block size: 4 MB" e volta ao prompt. Ou seja, o main() está a fazer só a parte de demo (criar o ficheiro dummy, calcular tamanho/blocos) e depois não chama nada a seguir — não injeta, não faz hook, não inicializa o tiering, não reporta VRAM. O fluxo simplesmente termina ali.
+
+Isto não é um bug de lógica interna do UMC (como os que já tínhamos identificado no allocateSystemVirtual()); é mais básico: o main() nunca chega a invocar o resto do pipeline.
+
+Precisava de ver o main.cpp (ou o ficheiro de entrada equivalente) para confirmar, mas as causas mais prováveis são:
+
+Falta a chamada à função de inicialização do UMC/hooking depois do loader do modelo — o código para aí porque não há mais nenhuma instrução no main() a seguir ao print do block size.
+Existe um return 0; ou exit(0); prematuro logo a seguir a essa secção de demo, antes do código de injeção/hook.
+O umc.exe que estás a correr é standalone e nunca teve como alvo um processo (ex. ComfyUI/python.exe) para injetar — se o UMC é suposto injetar-se noutro processo (IAT hooking), correr umc.exe sozinho, sem apontar para um PID ou lançar o processo alvo, pode ser literalmente "só a demo" por design, e falta o passo de lançar/injetar no python.exe do ComfyUI.
+Consegues colar o main.cpp (ou mostrar-me a função main)? Assim vejo exatamente onde o fluxo para e se falta a chamada ao injetor/hook.
+
+
+umc_hook.cpp
+cpp
+
+
+VirtualGpuMemory.cpp
+cpp
+
+
+main.cpp
+251 linhas
+
+txt
+
+
+umc_loader.cpp
+144 linhas
+
+txt
+
+
+UMCModelLoader.cpp
+49 linhas
+
+txt
+
+basicamente é isto
+
+
+Identificou deadlock em mutex e propôs soluções
+Identificou deadlock em mutex e propôs soluções
+Encontrei o bug — e é grave: é um deadlock por double-lock do mesmo mutex, não relacionado com os gaps de tiering que já sabíamos.
+
+O problema, linha a linha:
+
+cpp
+bool VirtualGpuMemory::writeBlock(size_t blockId, const void* data, size_t size) {
+    std::lock_guard<std::mutex> lock(m_mutex);   // ← BLOQUEIA m_mutex aqui
+
+    BlockLocation loc;
+    if (!getBlockLocation(blockId, loc)) {        // ← chama função que TAMBÉM bloqueia m_mutex
+cpp
+bool VirtualGpuMemory::getBlockLocation(size_t blockId, BlockLocation& outLocation) const {
+    std::lock_guard<std::mutex> lock(m_mutex);   // ← tenta bloquear o MESMO mutex outra vez
+std::mutex não é reentrante. Quando uma thread tenta fazer lock de um mutex que ela própria já detém, o comportamento é indefinido — na prática, em Windows, isto bloqueia para sempre (deadlock).
+
+É exatamente isto que explica o sintoma: o programa imprime até "Block size: 4 MB", entra no loadModel(), chama writeBlock(0, ...) pela primeira vez, que chama getBlockLocation(0, ...) internamente — e trava ali, silenciosamente, sem crash, sem erro, sem mais output. "Não faz nada" = está preso, não morreu.
+
+O mesmo padrão repete-se em write() (linha ~224), que também chama getBlockLocation() dentro do seu próprio lock_guard.
+
+A correção mais limpa: criar uma versão "unlocked" interna, usada pelas funções que já detêm o lock:
+
+
+Ver contexto antes de getBlockLocation
+Ver contexto antes de getBlockLocation
+Agora vou aplicar a correção. Precisa de um helper interno "unlocked" e alterar as duas chamadas problemáticas:
+
+
+Deliberated sobre fornecer instruções textuais e diffs
+Deliberated sobre fornecer instruções textuais e diffs
+Não tenho o .h, mas a correção é simples de aplicares tu mesmo. Precisas de 3 alterações:
+
+1. No VirtualGpuMemory.h, adiciona um método privado novo (perto da declaração de getBlockLocation):
+
+cpp
+private:
+    bool getBlockLocationUnlocked(size_t blockId, BlockLocation& outLocation) const; // NOVO
+2. No VirtualGpuMemory.cpp, cria a versão sem lock e faz a pública chamá-la:
+
+
+Editou 2 arquivos, executou um comando
+Editou 2 arquivos, executou um comando
+3. Agora corrige as duas chamadas que causavam o deadlock, para usarem a versão unlocked (já estão dentro de secções que detêm o lock):
+
+
+Identificou deadlock sistêmico e propôs solução recursiva
+Identificou deadlock sistêmico e propôs solução recursiva
+Espera — encontrei mais um problema do mesmo tipo. writeBlock() também chama allocateBlockPhysical() → allocateRam(), e essa também faz lock_guard no mesmo m_mutex — outro deadlock potencial, ainda dentro da mesma função.
+
+
+Mapear todas as funções que fazem lock, para ver a extensão do problema

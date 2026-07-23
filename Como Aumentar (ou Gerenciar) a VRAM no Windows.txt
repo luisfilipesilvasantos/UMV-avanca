@@ -1,0 +1,31 @@
+﻿Aqui está o conteúdo do documento resumido e estruturado para fácil cópia e colagem, conforme solicitado.
+Guia: Como Aumentar (ou Gerenciar) a VRAM no Windows
+O que é VRAM?
+* A Video RAM (VRAM) é uma RAM dedicada que trabalha em conjunto com a GPU.
+* Ela armazena texturas de jogos, efeitos de iluminação e outros dados que a GPU precisa acessar rapidamente.
+* Tarefas como jogos em 4K, edição de vídeo de alta qualidade, Photoshop e softwares de design 3D (como AutoCAD) exigem volumes maiores de VRAM.
+Como Verificar a VRAM no Windows 11
+1. Pressione Win + I para abrir as Configurações.
+2. Vá em Sistema > Tela.
+3. Role para baixo e clique em Tela avançada.
+4. Clique em Exibir propriedades do adaptador de vídeo.
+* Nota: No Windows 10, este caminho é similar através das Configurações de exibição avançadas.
+Diferença: Gráficos Dedicados vs. Integrados
+* Dedicados: A VRAM é fixa na placa de vídeo. Não pode ser aumentada sem comprar uma placa nova.
+* Integrados: Compartilham a memória RAM do sistema. São soluções econômicas, mas com desempenho inferior para jogos ou tarefas intensas.
+"Tratamento" para Aumentar VRAM (Gráficos Integrados)
+Embora não seja possível aumentar a VRAM física em placas dedicadas, existem métodos para contornar limitações em gráficos integrados:
+* Ajuste na BIOS/UEFI:
+   * Entre na BIOS e procure por opções como Advanced Chipset Features, Graphics Settings ou VGA Share Memory Size.
+   * É possível alocar mais memória para a GPU (ex: aumentar de 128MB para 256MB ou 512MB), se disponível.
+* Truque via Registro (regedit):
+   * Este método serve para criar um "valor fictício" caso um jogo recuse a execução por falta de VRAM detectada.
+   * Navegue até HKEY_LOCAL_MACHINE\Software\Intel.
+   * Crie uma chave chamada GMM e dentro dela um valor DWORD (32-bit) chamado DedicatedSegmentSize.
+   * Defina o valor em Decimal (máximo de 512 MB) e reinicie o computador.
+   * Atenção: Modificar o registro pode danificar o sistema; proceda com cuidado.
+Diretrizes para Upgrade de VRAM
+* 1+GB: Apenas para jogos antigos; não recomendado para edição ou 3D.
+* 4+GB: Insuficiente para jogos modernos.
+* 8+GB: O mínimo para jogos em 1080p, mas pode ser pouco para o futuro.
+* 12+GB: Uma excelente base para jogos em 1440p e um bom custo-benefício atual.

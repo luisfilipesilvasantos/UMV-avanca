@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20)
+project(UMC)
+
+add_executable(umc_no_cuda umc_no_cuda.cpp VirtualGpuMemory.cpp)
+target_include_directories(umc_no_cuda PRIVATE .)
+
+# Forçar runtime estático (evita dependências DLL)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")

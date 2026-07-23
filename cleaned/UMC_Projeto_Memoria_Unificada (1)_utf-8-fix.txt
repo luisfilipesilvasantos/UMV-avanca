@@ -1,0 +1,368 @@
+================================================================================
+UMC — UNIFIED MEMORY CONTROLLER
+Projeto de Memória Unificada Multi-GPU: VRAM (N GPUs) + RAM + Pagefile
+Com técnicas de datacenter para o PyTorch "ver" a memória que nós definimos
+================================================================================
+
+Autor: Luís Filipe da Silva
+Hardware alvo: AMD Ryzen 9 5950X | RTX 3060 12GB (expansível a multi-GPU) |
+                64GB RAM | Windows 11 Insider
+Data do documento: 08/07/2026 (revisão 2)
+
+================================================================================
+1. OBJETIVO DO PROJETO
+================================================================================
+
+Criar um sistema de memória unificada por injeção de DLL (IAT Hooking sobre a
+CUDA Runtime API e Driver API), que intercepta chamadas de alocação e de
+consulta de memória (cudaMalloc, cuMemAlloc, cudaMemGetInfo, cuMemGetInfo,
+cuDeviceTotalMem, etc.) feitas por processos como ComfyUI/PyTorch, e:
+
+  1. Redireciona transparentemente a alocação real para uma pool virtual de
+     três níveis (VRAM de uma ou mais GPUs, RAM, Pagefile como staging);
+  2. Faz o PyTorch REPORTAR e ACREDITAR que a GPU tem a capacidade de memória
+     que NÓS definimos (ex.: 12GB físicos -> 48GB "virtuais"), em vez da
+     capacidade real devolvida pelo hardware/driver.
+
+Este segundo ponto é a peça nova deste documento: como técnicas usadas em
+datacenters (NVLink, GPUDirect, CUDA Unified Memory, allocators plugáveis)
+podem ser combinadas para atingir isto de forma robusta em vez de "hackeada".
+
+================================================================================
+2. O QUE FOI REALIZADO ATÉ AO MOMENTO
+================================================================================
+
+2.1 Arquitetura base implementada
+----------------------------------
+- Blocos de tamanho fixo (4 MB) mapeados por registo thread-safe:
+  std::unordered_map<size_t, BlockLocation>
+- struct BlockLocation { tier; deviceId; physicalOffset; size; }
+- Tier VRAM orquestrado via CUDA Runtime API (cudaMalloc/cudaMemcpy/cudaFree)
+- Tier RAM implementado com VirtualAlloc (MEM_COMMIT | MEM_RESERVE,
+  PAGE_READWRITE)
+- Tier Pagefile implementado com CreateFileMapping(INVALID_HANDLE_VALUE) +
+  janelas deslizantes MapViewOfFile/UnmapViewOfFile
+- Acesso byte-a-byte com split automático em fronteiras de bloco
+- Demo funcional validada (48MB em ficheiro, budgets de 16MB/tier,
+  verificação de integridade, teste de fronteira de 4MB)
+
+2.2 Correções já efetuadas
+------------------------------
+- Bug de compilação: newline em falta a destruir a compilação (corrigido)
+- CUmemPool -> CUmemoryPool; cuMemPoolAlloc -> cuMemAllocFromPoolAsync
+
+2.3 Lacunas críticas identificadas (debugging ativo)
+--------------------------------------------------------
+  a) allocateSystemVirtual() sem pinning CUDA (falta cudaHostRegister)
+  b) m_totalVirtualCapacity nunca inicializado
+  c) Tiering desligado do caminho real dos hooks de interceção
+
+2.4 Decisão já tomada na revisão anterior
+----------------------------------------------
+A capacidade total reportada = VRAM + RAM. O Pagefile nunca conta para a
+capacidade útil; existe apenas como staging temporário entre VRAM e RAM.
+Esta decisão mantém-se e é reforçada pelas técnicas descritas abaixo.
+
+================================================================================
+3. TECNOLOGIAS DE DATACENTER APLICÁVEIS AO PROJETO
+================================================================================
+
+Em servidores/datacenters, o problema "um único processo/tensor precisa de
+mais memória do que uma GPU tem" já é resolvido há anos com um conjunto de
+tecnologias NVIDIA. Não têm de ser reinventadas — podem ser reaproveitadas ou
+usadas como inspiração direta para o UMC:
+
+3.1 CUDA Unified Memory (UVM) — cudaMallocManaged
+------------------------------------------------------
+- Desde Pascal (GTX 10xx em diante, logo válido para a RTX 3060), o driver
+  NVIDIA suporta um espaço de endereços ÚNICO partilhado entre CPU e GPU.
+- cudaMallocManaged() aloca memória que "não vive" fisicamente nem em VRAM
+  nem em RAM de forma fixa — o driver faz PAGE MIGRATION automática sob
+  demanda (demand paging), movendo páginas de 4KB/2MB entre VRAM e RAM
+  consoante quem acede a elas (via page faults tratados pelo driver, não
+  pela aplicação).
+- SUPORTA OVERSUBSCRIPTION: é possível fazer cudaMallocManaged(50GB) numa
+  GPU com 12GB de VRAM, DESDE QUE haja RAM suficiente no sistema. O driver
+  trata o excesso automaticamente como "swap" para RAM — exatamente o
+  comportamento que o UMC está a tentar replicar manualmente com
+  VirtualAlloc + memcpy.
+- Ferramentas de afinação: cudaMemAdvise() (dar dicas de padrão de acesso:
+  PREFERRED_LOCATION, ACCESSED_BY, READ_MOSTLY) e cudaMemPrefetchAsync()
+  (forçar antecipadamente a migração de um bloco para um dispositivo,
+  equivalente ao "prefetch thread" já planeado no UMC).
+- IMPLICAÇÃO PARA O UMC: em vez de reimplementar manualmente o SwapEngine a
+  copiar bytes entre VRAM/RAM/Pagefile, o UMC pode usar cudaMallocManaged
+  como camada de base do Tier 1+2 combinados, e reservar a lógica manual
+  apenas para controlo fino de política (LRU customizado) via
+  cudaMemAdvise/cudaMemPrefetchAsync. Isto reduz drasticamente a
+  complexidade e o risco de bugs de sincronização face à abordagem 100%
+  manual atual.
+
+3.2 GPUDirect Peer-to-Peer (P2P) — multi-GPU
+------------------------------------------------
+- Quando existem 2+ GPUs NVIDIA ligadas por PCIe (ou idealmente NVLink/
+  NVSwitch em hardware de datacenter), cudaDeviceEnablePeerAccess() permite
+  que uma GPU aceda diretamente à VRAM de outra GPU, SEM passar pela RAM do
+  anfitrião nem pelo CPU.
+- Sem NVLink (caso típico de consumo, ex. 2x RTX 3060 em PCIe): o P2P ainda
+  funciona via PCIe, mas com menor largura de banda; verificar sempre com
+  cudaDeviceCanAccessPeer() antes de ativar.
+- IMPLICAÇÃO PARA O UMC: o Tier 1 deixa de ser "uma VRAM" e passa a ser um
+  POOL de VRAM de N GPUs. O TierCapacityManager passa a somar
+  VRAM_livre(GPU0) + VRAM_livre(GPU1) + ... e o SwapEngine pode mover blocos
+  diretamente GPU-a-GPU via P2P quando ambas as GPUs suportam
+  cudaDeviceCanAccessPeer, evitando o "salto" desnecessário por RAM.
+
+3.3 GPUDirect Storage (GDS) — pagefile "acelerado"
+-------------------------------------------------------
+- Em datacenters, o GDS permite DMA direto entre um SSD NVMe e a VRAM,
+  contornando completamente a CPU e a RAM (bypass total do "bounce buffer").
+- No ecossistema Windows/consumidor isto não está tão maduro como em
+  Linux+NVMe enterprise, mas o princípio aplica-se ao Tier 3 (Pagefile):
+  em vez de um round-trip Pagefile -> RAM -> VRAM, se o hardware suportar,
+  usar uma cópia mais direta SSD -> VRAM reduz latência de swap.
+- Nível mínimo aplicável já hoje no Windows: manter os buffers de staging
+  do pagefile como memória pinned (cudaHostRegister), para que a cópia
+  H2D subsequente seja sempre DMA assíncrono real e não uma cópia pageable
+  lenta.
+
+3.4 NCCL (NVIDIA Collective Communications Library)
+--------------------------------------------------------
+- Usado em datacenters para sincronizar tensores entre múltiplas GPUs
+  (all-reduce, broadcast, etc.) de forma otimizada para a topologia
+  (NVLink > PCIe > rede).
+- Não é estritamente necessário para o caso de uso atual (um único processo
+  ComfyUI/PyTorch a "esticar" memória), mas se o UMC evoluir para permitir
+  paralelizar a INFERÊNCIA (não só a memória) por várias GPUs, o NCCL é o
+  caminho natural em vez de reinventar comunicação P2P manual para dados de
+  computação (distinto de dados de "armazenamento" que o UMC gere).
+
+3.5 MIG (Multi-Instance GPU) — nota de exclusão
+----------------------------------------------------
+- Tecnologia de particionamento de GPU (A100/H100 em datacenter) para
+  isolar várias cargas de trabalho numa única GPU física.
+- NÃO aplicável à RTX 3060 (não suporta MIG); mencionado apenas por
+  completude e para não ser confundido com o objetivo deste projeto, que é
+  o INVERSO (agregar memória de várias fontes, não particionar uma única).
+
+================================================================================
+4. COMO FAZER O PYTORCH "VER" A MEMÓRIA QUE NÓS DEFINIMOS
+================================================================================
+
+Esta é a pergunta central: o PyTorch não lê a memória da GPU "por magia" —
+consulta a API do CUDA em pontos específicos. Para controlar o que ele vê,
+há duas abordagens que se complementam:
+
+4.1 ABORDAGEM A (recomendada, oficial): CUDAPluggableAllocator
+--------------------------------------------------------------------
+- Desde o PyTorch 2.0, existe um ponto de extensão OFICIAL e suportado:
+  torch.cuda.memory.CUDAPluggableAllocator.
+- Permite compilar uma biblioteca .dll/.so própria com duas funções
+  (alloc e free, com assinatura C definida pela API do PyTorch) e registá-la
+  como o allocator ativo do CUDA Caching Allocator interno do PyTorch.
+- Vantagem crítica: o PyTorch deixa de chamar cudaMalloc/cudaFree
+  diretamente — chama SEMPRE as nossas funções. Isto elimina a necessidade
+  de fazer IAT hooking "à bruta" sobre o cudaMalloc do processo inteiro, que
+  é frágil (pode falhar com delay-loaded DLLs, como já notado nos riscos).
+- As nossas funções de alloc/free são exatamente o TierManager::
+  decideTierAndAllocate() já planeado — a única mudança é o PONTO DE
+  ENTRADA: em vez de um hook IAT, é uma API pública e estável do PyTorch.
+- LIMITAÇÃO: cobre apenas alocação de tensores. Não controla o que
+  torch.cuda.get_device_properties() ou torch.cuda.mem_get_info() devolvem
+  como capacidade total/livre — para isso é preciso a Abordagem B.
+
+4.2 ABORDAGEM B (necessária para "mentir" sobre a capacidade): hook de
+    cudaMemGetInfo / cuMemGetInfo / cuDeviceTotalMem
+--------------------------------------------------------------------------
+- O PyTorch (e o ComfyUI, que faz a sua própria gestão de VRAM por cima do
+  PyTorch) consulta periodicamente a capacidade "real" da GPU através de:
+      cudaMemGetInfo(&free, &total)   [Runtime API]
+      cuMemGetInfo(&free, &total)      [Driver API, equivalente]
+      cuDeviceTotalMem(&bytes, dev)    [capacidade total do dispositivo]
+- Para que estas chamadas devolvam os valores VIRTUAIS definidos pelo UMC
+  (ex.: total = VRAM_real + RAM_reservada) em vez dos valores reais do
+  hardware, o UMC continua a precisar do IAT hooking já existente — mas
+  agora com um alvo preciso e pequeno: apenas estas 2-3 funções de consulta,
+  em vez de tentar interceptar todo o ciclo de vida de alocação.
+- Isto simplifica drasticamente a superfície de hooking face à arquitetura
+  original: ALLOC/FREE passam a ser geridos via CUDAPluggableAllocator
+  (Abordagem A, estável); QUERY DE CAPACIDADE continua via IAT hook
+  (Abordagem B, cirúrgico e pequeno).
+- Valores a devolver pelo hook:
+      total = capacidade_virtual_total (VRAM real de todas as GPUs + RAM
+              reservada para extensão, conforme TierCapacityManager)
+      free  = total - soma_de_bytes_atualmente_alocados_pelo_TierManager
+- IMPORTANTE: o "free" tem de refletir sempre o estado real de ocupação do
+  TierManager (não pode ser um valor estático), ou o PyTorch vai tentar
+  alocar mais do que existe fisicamente disponível em determinado momento e
+  o UMC terá de fazer swap síncrono no momento do malloc — o que é
+  suportado, mas deve ser tido em conta no dimensionamento de margem de
+  segurança (headroom).
+
+4.3 Combinação das duas abordagens (arquitetura final recomendada)
+------------------------------------------------------------------------
+
+    PyTorch / ComfyUI
+          |
+          | tensor.cuda() / model.to("cuda")
+          v
+    CUDACachingAllocator (interno do PyTorch)
+          |
+          | chama SEMPRE as nossas funções registadas
+          v
+    +--------------------------------------+
+    |   UMC::PluggableAllocator::alloc()    |  <-- Abordagem A (oficial)
+    |   -> TierManager::decideTierAndAlloc  |
+    +--------------------------------------+
+          |
+          v
+    TierManager  --(consulta)-->  TierCapacityManager
+          |                              ^
+          v                              |
+    VRAM(GPU0..N) / RAM / Pagefile-staging
+          ^
+          |
+    cudaMemGetInfo / cuMemGetInfo  <-- Abordagem B (IAT hook cirúrgico)
+    devolve (free,total) VIRTUAIS calculados a partir do
+    TierCapacityManager, não os valores reais do driver
+
+4.4 Nota sobre o UVM (secção 3.1) face a esta arquitetura
+----------------------------------------------------------------
+Se se optar por basear o Tier 1+2 em cudaMallocManaged (UVM) em vez de
+gestão 100% manual, a Abordagem A simplifica-se ainda mais: o "alloc" do
+CUDAPluggableAllocator passa a ser essencialmente cudaMallocManaged(size)
+com cudaMemAdvise para dar a preferência de localização inicial (VRAM), e o
+driver trata da migração de páginas sozinho. A Abordagem B mantém-se igual
+(continua a ser preciso mentir sobre free/total, porque isso o UVM não faz
+por si só — o UVM só resolve o ONDE fisicamente reside o dado, não o QUE o
+PyTorch pensa que tem disponível).
+
+================================================================================
+5. ARQUITETURA MULTI-GPU (POOL DE VRAM AGREGADO)
+================================================================================
+
+    Espaço lógico endereçável = (VRAM_GPU0 + VRAM_GPU1 + ... + VRAM_GPUn) + RAM
+    (Pagefile continua a NÃO contar para o total; é staging puro)
+
+    +-------------------------------------------------------------+
+    |            Espaço Virtual Lógico Multi-GPU + RAM              |
+    +-------------------------------------------------------------+
+        |            |            |                    |
+        v            v            v                    v
+    +--------+   +--------+   +--------+          +----------+
+    | GPU 0   |   | GPU 1   |   | GPU N   |  P2P     |  RAM      |
+    | VRAM    |<->| VRAM    |<->| VRAM    |<-------->| (Tier 2)  |
+    +--------+   +--------+   +--------+          +----------+
+        ^ P2P direto via cudaDeviceEnablePeerAccess quando disponível
+        |
+        +------------------------ fallback: via RAM se sem P2P -------+
+                                                            |
+                                                            v
+                                                    +----------------+
+                                                    |  Pagefile        |
+                                                    |  (staging only)  |
+                                                    +----------------+
+
+Regras adicionais para multi-GPU:
+  1. TierCapacityManager passa a manter um array por dispositivo
+     (NVML por GPU), somando o total disponível.
+  2. decideTierAndAllocate() escolhe primeiro a GPU com mais espaço livre
+     (balanceamento simples tipo "least loaded"); heurísticas mais
+     avançadas (afinidade a dados já colocados, largura de banda NVLink vs
+     PCIe) ficam para uma fase posterior.
+  3. Transferências entre GPUs usam P2P quando cudaDeviceCanAccessPeer()
+     confirma suporte; caso contrário, fazem staging via RAM (D2H numa GPU,
+     H2D na outra).
+
+================================================================================
+6. PLANO DE IMPLEMENTAÇÃO POR FASES (ATUALIZADO)
+================================================================================
+
+FASE 0 — Fundação (bloqueante, já identificada)
+------------------------------------------------------
+  [ ] Corrigir allocateSystemVirtual() (cudaHostRegister/unregister)
+  [ ] Inicializar m_totalVirtualCapacity = VRAM + RAM
+  [ ] Ligar hooks ao TierManager::decideTierAndAllocate()
+
+FASE 1 — Migrar allocação para CUDAPluggableAllocator
+-----------------------------------------------------------
+  [ ] Compilar biblioteca UMC com assinatura de alloc/free exigida pelo
+      torch.cuda.memory.CUDAPluggableAllocator
+  [ ] Registar o allocator no arranque do processo ComfyUI/PyTorch
+      (via torch.cuda.memory.change_current_allocator)
+  [ ] Remover progressivamente a dependência do IAT hooking para
+      alloc/free (mantém-se apenas para query de capacidade — Fase 2)
+
+FASE 2 — Hook cirúrgico de capacidade (Abordagem B)
+-----------------------------------------------------------
+  [ ] IAT hook de cudaMemGetInfo / cuMemGetInfo / cuDeviceTotalMem
+  [ ] Ligar valores devolvidos ao TierCapacityManager em tempo real
+  [ ] Validar que ComfyUI (que faz a sua própria estimativa de VRAM livre
+      para decidir batch size / offload) respeita os valores virtuais
+
+FASE 3 — Avaliar migração do Tier 1+2 para CUDA Unified Memory (UVM)
+--------------------------------------------------------------------------
+  [ ] Protótipo com cudaMallocManaged + cudaMemAdvise/cudaMemPrefetchAsync
+  [ ] Benchmark comparativo: gestão manual (VirtualAlloc+memcpy) vs UVM
+  [ ] Decisão: manter gestão manual (mais controlo) ou adotar UVM (menos
+      código, menos risco de bugs, potencialmente menos previsível)
+
+FASE 4 — Suporte multi-GPU
+------------------------------
+  [ ] TierCapacityManager multi-dispositivo (NVML por GPU)
+  [ ] cudaDeviceEnablePeerAccess + cudaDeviceCanAccessPeer no arranque
+  [ ] decideTierAndAllocate com balanceamento least-loaded entre GPUs
+  [ ] SwapEngine com transferência P2P direta quando disponível
+
+FASE 5 — Pagefile como staging otimizado
+-----------------------------------------------
+  [ ] Buffers de staging sempre pinned (cudaHostRegister)
+  [ ] Garantir pagefile vazio em steady state (auditoria de handles)
+  [ ] (Opcional/exploratório) avaliar viabilidade de DMA mais direto
+      SSD->VRAM no Windows, inspirado em GPUDirect Storage
+
+FASE 6 — Robustez, telemetria e produção
+---------------------------------------------
+  [ ] Tratamento de OOM real (VRAM+RAM esgotados em simultâneo)
+  [ ] Logging/diagnóstico (mapa de alocação por tier e por GPU)
+  [ ] Testes de carga com LTX-2.3 / Wan Video, com e sem 2ª GPU
+  [ ] Documentação final da API pública
+
+================================================================================
+7. RISCOS TÉCNICOS (ATUALIZADO)
+================================================================================
+
+  - RAM pinned em excesso degrada o SO (não paginável) — limite configurável
+  - IAT hooking em cudaMalloc é frágil com delay-loaded DLLs — MITIGADO na
+    Fase 1 ao mover alloc/free para o CUDAPluggableAllocator oficial; o
+    hooking fica confinado às funções de query (superfície muito menor)
+  - Mentir sobre free/total (Abordagem B) obriga a manter esse valor
+    sempre consistente com o estado real do TierManager, sob pena de o
+    PyTorch tentar alocar mais do que existe fisicamente disponível num
+    dado instante — necessário headroom de segurança
+  - P2P sem NVLink (só PCIe) tem largura de banda limitada; não assumir
+    performance de datacenter em hardware de consumo — validar sempre com
+    cudaDeviceCanAccessPeer() e medir, não presumir
+  - UVM (Fase 3) introduz page faults geridos pelo driver, cujo timing não
+    é totalmente controlável pela aplicação — pode complicar a previsão de
+    latência para inferência em tempo real; validar com benchmark antes de
+    adotar em produção
+  - Concorrência no registo std::unordered_map<size_t, BlockLocation> —
+    lock fino ou sharding necessário com múltiplas threads de prefetch/swap
+
+================================================================================
+8. PRÓXIMO PASSO IMEDIATO
+================================================================================
+
+  1. Corrigir allocateSystemVirtual() (pinning CUDA) — FASE 0
+  2. Inicializar m_totalVirtualCapacity — FASE 0
+  3. Ligar o TierManager ao caminho dos hooks — FASE 0
+  4. Prototipar o CUDAPluggableAllocator (FASE 1) em paralelo, já que não
+     depende da correção dos bugs acima e permite validar cedo se o
+     PyTorch aceita bem o novo ponto de entrada de alocação
+  5. Só depois avançar para o hook de cudaMemGetInfo (Fase 2), que é o
+     passo que efetivamente faz o PyTorch "ver" a memória virtual definida
+
+================================================================================
+FIM DO DOCUMENTO
+================================================================================

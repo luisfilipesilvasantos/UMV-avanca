@@ -1,0 +1,36 @@
+﻿std::string tierToString(MemoryTier tier) {
+    switch (tier) {
+        case MemoryTier::Vram:     return "VRAM";
+        case MemoryTier::Ram:      return "RAM";
+        case MemoryTier::Pagefile: return "Pagefile";
+    }
+    return "Unknown";
+}
+
+VirtualGpuMemory::VirtualGpuMemory(
+    size_t blockSizeBytes,
+    size_t maxVramBudget,
+    size_t maxRamBudget,
+    size_t maxPagefileBudget
+)
+: m_blockSizeBytes(blockSizeBytes)
+, m_totalVirtualCapacity(0)
+, m_totalHostRam(0)
+, m_availableHostRam(0)
+, m_totalPagefile(0)
+, m_availablePagefile(0)
+, m_hPagefileMapping(nullptr)
+, m_pagefileAllocatedBytes(0)
+, m_pagefileLimitBytes(0)
+, m_nvmlInitialized(false)
+, m_hostAllocatedBytes(0)
+, m_ramLimitBytes(0)
+, m_maxVramBudgetOverride(maxVramBudget)
+, m_maxRamBudgetOverride(maxRamBudget)
+, m_maxPagefileBudgetOverride(maxPagefileBudget)
+, m_globalAccessCounter(0)
+, m_historyWindowSize(100)
+, m_migrationHistoryWindowSize(100)
+{
+}
+

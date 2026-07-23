@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\luisf\UMC-avanca\CMakeFiles\5a5b693e54451d4b5a2586e770c9869b\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{D1EA74AE-6086-3D49-AAF6-38592E42D65C}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

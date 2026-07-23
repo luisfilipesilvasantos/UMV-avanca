@@ -1,0 +1,632 @@
+#include "VirtualGpuMemory.h"
+#include <algorithm>
+#include <cstring>
+
+std::string tierToString(MemoryTier tier) {
+    switch (tier) {
+    case MemoryTier::Vram:     return "VRAM";
+    case MemoryTier::Ram:      return "RAM";
+    case MemoryTier::Pagefile: return "Pagefile";
+    default:                   return "Unknown";
+    }
+}
+
+VirtualGpuMemory::VirtualGpuMemory(
+    size_t blockSizeBytes,
+    size_t maxVramBudget,
+    size_t maxRamBudget,
+    size_t maxPagefileBudget
+)
+    : m_blockSizeBytes(blockSizeBytes),
+      m_totalVirtualCapacity(0),
+      m_totalHostRam(0),
+      m_availableHostRam(0),
+      m_totalPagefile(0),
+      m_availablePagefile(0),
+      m_hPagefileMapping(nullptr),
+      m_pagefileAllocatedBytes(0),
+      m_pagefileLimitBytes(maxPagefileBudget),
+      m_nvmlInitialized(false),
+      m_globalAccessCounter(0),
+      m_historyWindowSize(1024),
+      m_migrationHistoryWindowSize(1024),
+      m_hostAllocatedBytes(0),
+      m_ramLimitBytes(maxRamBudget),
+      m_maxVramBudgetOverride(maxVramBudget),
+      m_maxRamBudgetOverride(maxRamBudget),
+      m_maxPagefileBudgetOverride(maxPagefileBudget)
+{
+    m_streams.clear();
+}
+
+VirtualGpuMemory::~VirtualGpuMemory() {
+    cleanup();
+}
+
+bool VirtualGpuMemory::initialize() {
+    // RAM info
+    MEMORYSTATUSEX memStatus{};
+    memStatus.dwLength = sizeof(memStatus);
+    if (GlobalMemoryStatusEx(&memStatus)) {
+        m_totalHostRam = static_cast<size_t>(memStatus.ullTotalPhys);
+        m_availableHostRam = static_cast<size_t>(memStatus.ullAvailPhys);
+    }
+
+    // Pagefile info simplificada (aproximação)
+    m_totalPagefile     = m_totalHostRam * 2;
+    m_availablePagefile = m_totalPagefile / 2;
+
+    // CUDA devices
+    int deviceCount = 0;
+    cudaError_t err = cudaGetDeviceCount(&deviceCount);
+    if (err == cudaSuccess && deviceCount > 0) {
+        for (int i = 0; i < deviceCount; ++i) {
+            cudaDeviceProp prop{};
+            if (cudaGetDeviceProperties(&prop, i) == cudaSuccess) {
+                GpuDeviceInfo info;
+                info.deviceId = i;
+                info.name     = prop.name;
+                info.totalVram = static_cast<size_t>(prop.totalGlobalMem);
+                info.freeVram  = info.totalVram;
+                m_gpuDevices.push_back(info);
+            }
+        }
+    }
+
+    m_gpuAllocatedBytes.assign(m_gpuDevices.size(), 0);
+    m_gpuLimitBytes.assign(
+        m_gpuDevices.size(),
+        m_maxVramBudgetOverride
+            ? m_maxVramBudgetOverride
+            : (m_gpuDevices.empty() ? 0 : m_gpuDevices[0].totalVram)
+    );
+    m_ramLimitBytes = m_maxRamBudgetOverride ? m_maxRamBudgetOverride : m_totalHostRam;
+
+    return true;
+}
+
+bool VirtualGpuMemory::allocateBlockPhysical(size_t blockId, BlockLocation& outLocation) {
+    // Para esta implementação, começamos sempre em RAM
+    return allocateRam(blockId, outLocation);
+}
+
+bool VirtualGpuMemory::allocateVram(size_t blockId, BlockLocation& outLocation) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (m_gpuDevices.empty()) {
+        return false;
+    }
+
+    int devId = 0; // simples: usa GPU 0
+    size_t needed = m_blockSizeBytes;
+    if (m_gpuAllocatedBytes[devId] + needed > m_gpuLimitBytes[devId]) {
+        return false;
+    }
+
+    m_gpuAllocatedBytes[devId] += needed;
+
+    outLocation.tier          = MemoryTier::Vram;
+    outLocation.deviceId      = devId;
+    outLocation.size          = needed;
+    outLocation.physicalOffset = 0;
+    outLocation.residentSince = m_globalAccessCounter;
+
+    m_blockMap[blockId] = outLocation;
+    if (m_blockData.find(blockId) == m_blockData.end()) {
+        m_blockData[blockId] = std::vector<char>(m_blockSizeBytes, 0);
+    }
+
+    logResidencyChange(blockId, MemoryTier::Vram, devId);
+    return true;
+}
+
+bool VirtualGpuMemory::allocateRam(size_t blockId, BlockLocation& outLocation) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    size_t needed = m_blockSizeBytes;
+    if (m_hostAllocatedBytes + needed > m_ramLimitBytes) {
+        return false;
+    }
+
+    m_hostAllocatedBytes += needed;
+
+    outLocation.tier          = MemoryTier::Ram;
+    outLocation.deviceId      = -1;
+    outLocation.size          = needed;
+    outLocation.physicalOffset = 0;
+    outLocation.residentSince = m_globalAccessCounter;
+
+    m_blockMap[blockId] = outLocation;
+    m_blockData[blockId] = std::vector<char>(m_blockSizeBytes, 0);
+
+    logResidencyChange(blockId, MemoryTier::Ram, -1);
+    return true;
+}
+
+bool VirtualGpuMemory::allocatePagefile(size_t blockId, BlockLocation& outLocation) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    size_t needed = m_blockSizeBytes;
+    if (m_pagefileAllocatedBytes + needed > m_maxPagefileBudgetOverride) {
+        return false;
+    }
+
+    m_pagefileAllocatedBytes += needed;
+
+    outLocation.tier          = MemoryTier::Pagefile;
+    outLocation.deviceId      = -1;
+    outLocation.size          = needed;
+    outLocation.physicalOffset = 0;
+    outLocation.residentSince = m_globalAccessCounter;
+
+    m_blockMap[blockId] = outLocation;
+    m_blockData[blockId] = std::vector<char>(m_blockSizeBytes, 0);
+
+    logResidencyChange(blockId, MemoryTier::Pagefile, -1);
+    return true;
+}
+
+bool VirtualGpuMemory::writeBlock(size_t blockId, const void* data, size_t size) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    BlockLocation loc;
+    if (!getBlockLocation(blockId, loc)) {
+        if (!allocateBlockPhysical(blockId, loc)) {
+            return false;
+        }
+    }
+
+    auto it = m_blockData.find(blockId);
+    if (it == m_blockData.end()) {
+        m_blockData[blockId] = std::vector<char>(m_blockSizeBytes, 0);
+        it = m_blockData.find(blockId);
+    }
+
+    if (size > m_blockSizeBytes) {
+        return false;
+    }
+
+    std::memcpy(it->second.data(), data, size);
+    registerAccess(blockId);
+    return true;
+}
+
+bool VirtualGpuMemory::readBlock(size_t blockId, void* outData, size_t size) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto it = m_blockData.find(blockId);
+    if (it == m_blockData.end()) {
+        return false;
+    }
+    if (size > m_blockSizeBytes) {
+        return false;
+    }
+
+    std::memcpy(outData, it->second.data(), size);
+    registerAccess(blockId);
+    return true;
+}
+
+bool VirtualGpuMemory::write(size_t logicalOffset, const void* data, size_t size) {
+    size_t blockId      = logicalOffset / m_blockSizeBytes;
+    size_t offsetInBlock = logicalOffset % m_blockSizeBytes;
+
+    const char* src = static_cast<const char*>(data);
+    size_t remaining = size;
+
+    while (remaining > 0) {
+        size_t toWrite = std::min(remaining, m_blockSizeBytes - offsetInBlock);
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            BlockLocation loc;
+            if (!getBlockLocation(blockId, loc)) {
+                if (!allocateBlockPhysical(blockId, loc)) {
+                    return false;
+                }
+            }
+            auto& buf = m_blockData[blockId];
+            if (buf.size() < m_blockSizeBytes) buf.resize(m_blockSizeBytes);
+            std::memcpy(buf.data() + offsetInBlock, src, toWrite);
+            registerAccess(blockId);
+        }
+
+        remaining   -= toWrite;
+        src         += toWrite;
+        blockId++;
+        offsetInBlock = 0;
+    }
+
+    return true;
+}
+
+bool VirtualGpuMemory::read(size_t logicalOffset, void* outData, size_t size) {
+    size_t blockId      = logicalOffset / m_blockSizeBytes;
+    size_t offsetInBlock = logicalOffset % m_blockSizeBytes;
+
+    char* dst = static_cast<char*>(outData);
+    size_t remaining = size;
+
+    while (remaining > 0) {
+        size_t toRead = std::min(remaining, m_blockSizeBytes - offsetInBlock);
+
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            auto it = m_blockData.find(blockId);
+            if (it == m_blockData.end()) {
+                return false;
+            }
+            std::memcpy(dst, it->second.data() + offsetInBlock, toRead);
+            registerAccess(blockId);
+        }
+
+        remaining   -= toRead;
+        dst         += toRead;
+        blockId++;
+        offsetInBlock = 0;
+    }
+
+    return true;
+}
+
+bool VirtualGpuMemory::getBlockLocation(size_t blockId, BlockLocation& outLocation) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_blockMap.find(blockId);
+    if (it == m_blockMap.end()) {
+        return false;
+    }
+    outLocation = it->second;
+    return true;
+}
+
+void VirtualGpuMemory::dumpLayout() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::cout << "=== VirtualGpuMemory Layout ===\n";
+    for (const auto& kv : m_blockMap) {
+        size_t id = kv.first;
+        const BlockLocation& loc = kv.second;
+        std::cout << "Block " << id
+                  << " | Tier: " << tierToString(loc.tier)
+                  << " | Dev: " << loc.deviceId
+                  << " | Size: " << (loc.size / (1024 * 1024)) << " MB\n";
+    }
+}
+
+void VirtualGpuMemory::registerAccess(size_t blockId) {
+    m_globalAccessCounter++;
+    m_accessTimestamps[blockId] = m_globalAccessCounter;
+}
+
+void VirtualGpuMemory::logResidencyChange(size_t blockId, MemoryTier newTier, int newDeviceId) {
+    uint64_t ts = m_globalAccessCounter;
+    ResidencyHistoryEntry entry{ newTier, newDeviceId, ts };
+    auto& dq = m_residencyHistory[blockId];
+    dq.push_back(entry);
+    if (dq.size() > m_historyWindowSize) {
+        dq.pop_front();
+    }
+    m_migrationHistory.push_back(entry);
+    if (m_migrationHistory.size() > m_migrationHistoryWindowSize) {
+        m_migrationHistory.pop_front();
+    }
+}
+
+bool VirtualGpuMemory::isThrashingDetected(size_t blockId) {
+    auto it = m_residencyHistory.find(blockId);
+    if (it == m_residencyHistory.end()) return false;
+    const auto& dq = it->second;
+    if (dq.size() < 4) return false;
+
+    int changes = 0;
+    for (size_t i = 1; i < dq.size(); ++i) {
+        if (dq[i].tier != dq[i - 1].tier) {
+            changes++;
+        }
+    }
+    double ratio = static_cast<double>(changes) / dq.size();
+    return ratio > 0.5;
+}
+
+bool VirtualGpuMemory::isThrashingDetected(int windowSize, double threshold) {
+    if (m_migrationHistory.size() < static_cast<size_t>(windowSize)) {
+        return false;
+    }
+    int changes = 0;
+    for (int i = 1; i < windowSize; ++i) {
+        const auto& cur  = m_migrationHistory[m_migrationHistory.size() - 1 - i];
+        const auto& prev = m_migrationHistory[m_migrationHistory.size() - i];
+        if (cur.tier != prev.tier || cur.deviceId != prev.deviceId) {
+            changes++;
+        }
+    }
+    double ratio = static_cast<double>(changes) / windowSize;
+    return ratio >= threshold;
+}
+
+bool VirtualGpuMemory::evictLRUBlockFromGPU(int targetDeviceId) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    size_t   candidateBlock = static_cast<size_t>(-1);
+    uint64_t oldestAccess   = UINT64_MAX;
+
+    for (const auto& kv : m_blockMap) {
+        size_t blockId = kv.first;
+        const BlockLocation& loc = kv.second;
+        if (loc.tier == MemoryTier::Vram && loc.deviceId == targetDeviceId) {
+            uint64_t ts = 0;
+            auto itTs = m_accessTimestamps.find(blockId);
+            if (itTs != m_accessTimestamps.end()) ts = itTs->second;
+            if (ts < oldestAccess) {
+                oldestAccess   = ts;
+                candidateBlock = blockId;
+            }
+        }
+    }
+
+    if (candidateBlock == static_cast<size_t>(-1)) {
+        return false;
+    }
+
+    return migrateBlockToTier(candidateBlock, MemoryTier::Ram, -1);
+}
+
+bool VirtualGpuMemory::migrateBlockToTier(size_t blockId, MemoryTier targetTier, int targetDeviceId) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto it = m_blockMap.find(blockId);
+    if (it == m_blockMap.end()) return false;
+
+    BlockLocation& loc = it->second;
+    MemoryTier oldTier = loc.tier;
+    int        oldDev  = loc.deviceId;
+
+    if (oldTier == targetTier && oldDev == targetDeviceId) {
+        return true;
+    }
+
+    if (oldTier == MemoryTier::Vram && oldDev >= 0) {
+        size_t sz = loc.size;
+        m_gpuAllocatedBytes[oldDev] =
+            (m_gpuAllocatedBytes[oldDev] >= sz)
+                ? (m_gpuAllocatedBytes[oldDev] - sz)
+                : 0;
+    } else if (oldTier == MemoryTier::Ram) {
+        size_t sz = loc.size;
+        m_hostAllocatedBytes =
+            (m_hostAllocatedBytes >= sz)
+                ? (m_hostAllocatedBytes - sz)
+                : 0;
+    } else if (oldTier == MemoryTier::Pagefile) {
+        size_t sz = loc.size;
+        m_pagefileAllocatedBytes =
+            (m_pagefileAllocatedBytes >= sz)
+                ? (m_pagefileAllocatedBytes - sz)
+                : 0;
+    }
+
+    BlockLocation newLoc;
+    newLoc.size           = loc.size;
+    newLoc.isPinned       = loc.isPinned;
+    newLoc.lastAccessTime = m_globalAccessCounter;
+    newLoc.residentSince  = m_globalAccessCounter;
+
+    bool ok = false;
+    if (targetTier == MemoryTier::Vram) {
+        ok = allocateVram(blockId, newLoc);
+    } else if (targetTier == MemoryTier::Ram) {
+        ok = allocateRam(blockId, newLoc);
+    } else {
+        ok = allocatePagefile(blockId, newLoc);
+    }
+
+    if (!ok) {
+        if (oldTier == MemoryTier::Vram && oldDev >= 0) {
+            m_gpuAllocatedBytes[oldDev] += loc.size;
+        } else if (oldTier == MemoryTier::Ram) {
+            m_hostAllocatedBytes += loc.size;
+        } else if (oldTier == MemoryTier::Pagefile) {
+            m_pagefileAllocatedBytes += loc.size;
+        }
+        return false;
+    }
+
+    m_blockMap[blockId] = newLoc;
+    logResidencyChange(blockId, newLoc.tier, newLoc.deviceId);
+    return true;
+}
+
+std::pair<size_t, std::vector<size_t>> VirtualGpuMemory::estimateWorkingSet(int windowSize) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    if (windowSize <= 0) windowSize = static_cast<int>(m_historyWindowSize);
+
+    std::vector<std::pair<size_t, uint64_t>> recent;
+    for (const auto& kv : m_accessTimestamps) {
+        recent.push_back(kv);
+    }
+    std::sort(recent.begin(), recent.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    std::vector<size_t> blocks;
+    size_t totalBytes = 0;
+    int    used       = 0;
+    for (const auto& p : recent) {
+        if (used >= windowSize) break;
+        size_t blockId = p.first;
+        blocks.push_back(blockId);
+        totalBytes += m_blockSizeBytes;
+        used++;
+    }
+
+    return { totalBytes, blocks };
+}
+
+void VirtualGpuMemory::prefetchBlocks(const std::vector<size_t>& blocks, MemoryTier targetTier) {
+    for (size_t b : blocks) {
+        migrateBlockToTier(b, targetTier, targetTier == MemoryTier::Vram ? 0 : -1);
+    }
+}
+
+void VirtualGpuMemory::simulatePageFault(size_t faultAddress) {
+    size_t blockId = faultAddress / m_blockSizeBytes;
+    BlockLocation loc;
+    if (!getBlockLocation(blockId, loc)) {
+        allocateBlockPhysical(blockId, loc);
+    }
+    migrateBlockToTier(blockId, MemoryTier::Ram, -1);
+}
+
+std::vector<ResidencyHistoryEntry> VirtualGpuMemory::getResidencyHistory(size_t blockId) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = m_residencyHistory.find(blockId);
+    if (it == m_residencyHistory.end()) return {};
+    return std::vector<ResidencyHistoryEntry>(it->second.begin(), it->second.end());
+}
+
+cudaStream_t VirtualGpuMemory::getOrCreateStream(int deviceId) {
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+
+    if (deviceId < 0) deviceId = 0;
+    if (deviceId >= static_cast<int>(m_gpuDevices.size())) {
+        return nullptr;
+    }
+
+    if (deviceId >= static_cast<int>(m_streams.size())) {
+        m_streams.resize(deviceId + 1, nullptr);
+    }
+
+    if (m_streams[deviceId] == nullptr) {
+        cudaStream_t s = nullptr;
+        cudaSetDevice(deviceId);
+        if (cudaStreamCreate(&s) != cudaSuccess) {
+            return nullptr;
+        }
+        m_streams[deviceId] = s;
+    }
+
+    return m_streams[deviceId];
+}
+
+bool VirtualGpuMemory::writeBlockAsync(size_t blockId, const void* data, size_t size, cudaStream_t stream) {
+    if (stream == nullptr) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        BlockLocation loc;
+        if (!getBlockLocation(blockId, loc)) {
+            if (!allocateBlockPhysical(blockId, loc)) {
+                return false;
+            }
+        }
+        auto& buf = m_blockData[blockId];
+        if (buf.size() < m_blockSizeBytes) buf.resize(m_blockSizeBytes);
+        if (size > m_blockSizeBytes) return false;
+        std::memcpy(buf.data(), data, size);
+        registerAccess(blockId);
+    }
+
+    return true;
+}
+
+void VirtualGpuMemory::synchronizeStream(cudaStream_t stream) {
+    if (stream) {
+        cudaStreamSynchronize(stream);
+    }
+}
+
+void VirtualGpuMemory::synchronizeAllStreams() {
+    std::lock_guard<std::mutex> lock(m_streamMutex);
+    for (auto s : m_streams) {
+        if (s) {
+            cudaStreamSynchronize(s);
+        }
+    }
+}
+
+void* VirtualGpuMemory::allocateSystemVirtual(size_t size, MemoryTier& outTier, int& outDeviceId) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    void* ptr = ::VirtualAlloc(nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!ptr) {
+        outTier     = MemoryTier::Pagefile;
+        outDeviceId = -1;
+        return nullptr;
+    }
+
+    AllocationEntry entry;
+    entry.tier        = MemoryTier::Ram;
+    entry.deviceId    = -1;
+    entry.size        = size;
+    entry.hostPtr     = ptr;
+    entry.hFileMapping = nullptr;
+
+    m_systemAllocations[ptr] = entry;
+
+    outTier     = entry.tier;
+    outDeviceId = entry.deviceId;
+
+    SystemAllocationEntry track;
+    track.tier       = entry.tier;
+    track.deviceId   = entry.deviceId;
+    track.hostPtr    = entry.hostPtr;
+    track.hFileMapping = entry.hFileMapping;
+    m_systemAllocationsTrack[ptr] = track;
+
+    return ptr;
+}
+
+void VirtualGpuMemory::freeSystemVirtual(void* devPtr) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto it = m_systemAllocations.find(devPtr);
+    if (it != m_systemAllocations.end()) {
+        if (it->second.hostPtr) {
+            ::VirtualFree(it->second.hostPtr, 0, MEM_RELEASE);
+        }
+        m_systemAllocations.erase(it);
+    }
+    m_systemAllocationsTrack.erase(devPtr);
+}
+
+bool VirtualGpuMemory::isSystemAllocation(void* devPtr, BlockLocation& outLoc) const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+
+    auto it = m_systemAllocationsTrack.find(devPtr);
+    if (it == m_systemAllocationsTrack.end()) return false;
+
+    const auto& e = it->second;
+    outLoc.tier          = e.tier;
+    outLoc.deviceId      = e.deviceId;
+    outLoc.physicalOffset = reinterpret_cast<size_t>(e.hostPtr);
+    outLoc.size          = 0;
+    outLoc.isPinned      = false;
+    outLoc.lastAccessTime = 0;
+    outLoc.residentSince  = 0;
+    return true;
+}
+
+void VirtualGpuMemory::cleanup() {
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (auto& kv : m_systemAllocations) {
+            if (kv.second.hostPtr) {
+                ::VirtualFree(kv.second.hostPtr, 0, MEM_RELEASE);
+            }
+        }
+        m_systemAllocations.clear();
+        m_systemAllocationsTrack.clear();
+        m_blockData.clear();
+        m_blockMap.clear();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_streamMutex);
+        for (auto& s : m_streams) {
+            if (s) {
+                cudaStreamDestroy(s);
+                s = nullptr;
+            }
+        }
+        m_streams.clear();
+    }
+}

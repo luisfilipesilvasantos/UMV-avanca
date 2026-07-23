@@ -1,0 +1,9 @@
+In file included from C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\include/device_types.h:59,
+                 from C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\include/builtin_types.h:56,
+                 from cuda_runtime.h:90,
+                 from VirtualGpuMemory.h:14,
+                 from VirtualGpuMemory.cpp:1:
+C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\include/crt/host_defines.h:96:9: warning: '__cdecl' redefined
+   96 | #define __cdecl
+      |         ^~~~~~~
+<built-in>: note: this is the location of the previous definition

@@ -1,0 +1,278 @@
+================================================================================
+UMC — UNIFIED MEMORY CONTROLLER
+Projeto de Memória Unificada VRAM + RAM + Pagefile (Windows 11 / CUDA)
+================================================================================
+
+Autor: Luís Filipe da Silva
+Hardware alvo: AMD Ryzen 9 5950X | RTX 3060 12GB | 64GB RAM | Windows 11 Insider
+Data do documento: 08/07/2026
+
+================================================================================
+1. OBJETIVO DO PROJETO
+================================================================================
+
+Criar um sistema de memória unificada por injeção de DLL (IAT Hooking sobre a
+CUDA Runtime API e Driver API), que intercepta chamadas de alocação (cudaMalloc,
+cuMemAlloc, etc.) feitas por processos como ComfyUI/PyTorch, e redireciona
+transparentemente a alocação para uma pool virtual composta por três níveis
+(tiers) de memória física:
+
+    Tier 1 — VRAM      (GPU, acesso mais rápido)
+    Tier 2 — RAM        (extensão direta da VRAM)
+    Tier 3 — Pagefile   (cache temporária de transferência entre VRAM e RAM)
+
+MUDANÇA DE PARADIGMA relativamente à primeira versão (README atual):
+--------------------------------------------------------------------
+Na versão inicial, os três tiers eram tratados como níveis de armazenamento
+"paralelos e permanentes" (um bloco fica alocado onde coube). 
+
+Na nova arquitetura pretendida, a RAM passa a ser uma VERDADEIRA EXTENSÃO da
+VRAM (comporta-se como VRAM lenta, sempre endereçável), e o Pagefile deixa de
+ser um tier de armazenamento permanente — passa a ser uma ZONA DE CACHE /
+STAGING TEMPORÁRIO, usada apenas durante a transferência (swap) de blocos
+entre VRAM e RAM, e não como destino final de dados "frios".
+
+================================================================================
+2. O QUE FOI REALIZADO ATÉ AO MOMENTO
+================================================================================
+
+2.1 Arquitetura base implementada
+----------------------------------
+- Estrutura de blocos de tamanho fixo (4 MB por defeito) mapeados por um
+  registo thread-safe: std::unordered_map<size_t, BlockLocation>
+- struct BlockLocation { tier; deviceId; physicalOffset; size; }
+- Suporte multi-GPU planeado via NVML para monitorização (memória livre por
+  dispositivo) e CUDA Runtime API para orquestração (cudaMalloc/cudaMemcpy/
+  cudaFree)
+- Tier RAM implementado com VirtualAlloc (MEM_COMMIT | MEM_RESERVE,
+  PAGE_READWRITE)
+- Tier Pagefile implementado com CreateFileMapping(INVALID_HANDLE_VALUE) +
+  janelas deslizantes MapViewOfFile/UnmapViewOfFile (para não esgotar o
+  espaço de endereçamento virtual)
+- Acesso byte-a-byte com split automático de operações que atravessam
+  fronteiras de blocos
+- Demo funcional (umc_demo.exe / main.cpp) validado com ficheiro de 48MB,
+  budgets de 16MB por tier, verificação de integridade byte-a-byte, teste de
+  leitura/escrita a atravessar fronteira de bloco de 4MB
+
+2.2 Correções de código já efetuadas
+--------------------------------------
+- Bug de compilação: newline em falta a destruir a compilação (corrigido)
+- Uso incorreto da CUDA Driver API: tipos e chamadas trocados
+      CUmemPool          -> corrigido para CUmemoryPool
+      cuMemPoolAlloc      -> corrigido para cuMemAllocFromPoolAsync
+
+2.3 Trabalho em curso (debugging ativo)
+------------------------------------------
+Foram identificadas as seguintes lacunas críticas de implementação:
+
+  a) allocateSystemVirtual() — não faz pinning CUDA correto da memória RAM
+     alocada. Sem pinning (cudaHostRegister / cuMemHostRegister), as
+     transferências RAM<->VRAM não podem usar DMA assíncrono real e ficam
+     limitadas a cópias "pageable", muito mais lentas.
+
+  b) m_totalVirtualCapacity — nunca é atribuído/inicializado. A capacidade
+     total do espaço virtual reportado ao chamador (PyTorch/ComfyUI) fica
+     indefinida ou a zero, o que pode causar falhas de alocação a montante.
+
+  c) Subsistema de tiering desligado do caminho de hook do malloc — os hooks
+     de interceção (IAT hooking sobre cudaMalloc/cuMemAlloc) não estão
+     atualmente a invocar a lógica de decisão de tier; ou seja, a alocação
+     "inteligente" existe em teoria mas não está ligada ao ponto de entrada
+     real das chamadas interceptadas.
+
+2.4 Decisão de arquitetura pendente
+--------------------------------------
+Está por decidir se a capacidade virtual total reportada ao runtime deve ser:
+
+  OPÇÃO A (segura): VRAM + RAM apenas
+     - Mais simples e robusta
+     - Não requer interceção de kernel launches
+     - Risco de sub-utilização de capacidade se o pagefile também puder
+       servir como armazenamento de reserva
+
+  OPÇÃO B (agressiva): VRAM + RAM + Pagefile
+     - Requer interceção dos kernel launches (cudaLaunchKernel) para garantir
+       que nenhum kernel tenta aceder diretamente a um endereço que na
+       realidade está em pagefile e não foi ainda promovido a VRAM/RAM
+     - Maior complexidade e maior risco de corrupção de memória se a
+       promoção de tier não for síncrona com o lançamento do kernel
+
+  RECOMENDAÇÃO para a nova arquitetura (RAM=extensão, Pagefile=cache):
+     Esta decisão fica em grande parte resolvida pela mudança de paradigma:
+     se o pagefile deixa de ser um tier de armazenamento permanente e passa a
+     ser apenas uma zona de staging temporário, a capacidade total reportada
+     ao runtime deve ser VRAM + RAM (Opção A), e o Pagefile NUNCA é contado
+     como capacidade útil — é invisível ao runtime, existe apenas como
+     mecanismo interno de swap.
+
+================================================================================
+3. NOVA ARQUITETURA PROPOSTA (RAM = extensão de VRAM | Pagefile = cache)
+================================================================================
+
+3.1 Modelo conceptual
+------------------------
+
+    Espaço lógico endereçável = VRAM + RAM   (Pagefile NÃO conta para o total)
+
+    +---------------------------------------------------------+
+    |               Espaço Virtual Lógico (VRAM + RAM)         |
+    +---------------------------------------------------------+
+                |                              |
+                v                              v
+        +---------------+              +----------------+
+        |   TIER HOT     |   <----->    |   TIER WARM     |
+        |   VRAM (GPU)   |   swap       |   RAM (Host)     |
+        +---------------+              +----------------+
+                ^                              ^
+                |            Staging           |
+                +---------------+--------------+
+                                |
+                                v
+                        +----------------+
+                        |  TIER STAGING   |
+                        |  Pagefile       |
+                        |  (temporário)   |
+                        +----------------+
+
+Regras do novo modelo:
+
+  1. Todo o bloco lógico "vive" sempre em VRAM ou em RAM. Nunca reside de
+     forma permanente em pagefile.
+  2. O Pagefile só é usado como buffer intermédio quando:
+       - Há pressão de memória em ambos VRAM e RAM simultaneamente
+         (situação rara, tratada como "overflow de emergência"), OU
+       - Está a decorrer uma transferência em lote (batch) de vários blocos
+         entre VRAM e RAM e se pretende desacoplar o produtor do consumidor
+         (double buffering / streaming pipeline), usando o pagefile como
+         "gaveta" temporária para não bloquear a thread de cópia principal.
+  3. Após a transferência terminar, o bloco é removido do pagefile
+     (UnmapViewOfFile + libertação da view) — o pagefile fica sempre vazio
+     em repouso (steady state).
+
+3.2 Componentes técnicos a implementar
+------------------------------------------
+
+  A) Gestor de Capacidade Unificada (TierCapacityManager)
+     - Responsável por m_totalVirtualCapacity = VRAM_free + RAM_free
+     - Atualizado periodicamente (polling NVML + GlobalMemoryStatusEx)
+     - Reserva margem de segurança configurável (ex.: 10% headroom em RAM
+       para não competir com o SO)
+
+  B) Alocador com Pinning Correto (allocateSystemVirtual — corrigido)
+     - VirtualAlloc para reservar a região em RAM
+     - cudaHostRegister(ptr, size, cudaHostRegisterPortable) imediatamente
+       após o VirtualAlloc, para tornar a região "pinned" e elegível para
+       DMA assíncrono real (cudaMemcpyAsync)
+     - Registo do par (ptr, size) numa lista de "pinned regions" para
+       garantir cudaHostUnregister correto no free
+
+  C) Ponte de Interceção -> Tiering (ligar hooks ao dispatcher de tier)
+     - O hook de cudaMalloc/cuMemAlloc deve invocar diretamente
+       TierManager::decideTierAndAllocate(size) em vez de alocar
+       diretamente via cudaMalloc real
+     - decideTierAndAllocate() consulta o TierCapacityManager e decide:
+         VRAM se houver espaço livre >= size (+ margem)
+         RAM (pinned) caso contrário
+     - Esta ligação está atualmente EM FALTA e é o próximo passo crítico
+
+  D) Motor de Swap VRAM<->RAM com Staging em Pagefile (SwapEngine)
+     - Fila de pedidos de swap (LRU ou heurística baseada em último acesso)
+     - Para cada swap-out (VRAM -> RAM):
+         1. cudaMemcpyAsync(pagefile_staging_ptr, vram_ptr, size, D2H, stream)
+            [opcional: só se batch/streaming; caso contrário D2H direto para
+            RAM pinned, sem passar por pagefile]
+         2. Se usar staging: escreve a view mapeada do pagefile via
+            MapViewOfFile, faz memcpy do buffer intermédio, e
+            imediatamente UnmapViewOfFile
+         3. Atualiza BlockLocation do bloco para tier = RAM
+     - Para cada swap-in (RAM -> VRAM): processo inverso, H2D
+     - Pagefile só entra no caminho quando o SwapEngine decide fazer batch
+       streaming (várias transferências em pipeline); para swaps simples
+       ponto-a-ponto, a cópia é direta RAM<->VRAM sem staging
+
+  E) Double Buffering / Prefetch Thread
+     - Thread de fundo dedicada a pré-carregar a próxima camada/bloco de
+       RAM para VRAM enquanto a GPU processa a camada atual (conforme já
+       descrito no plano de integração ComfyUI/PyTorch)
+     - Sincronização via CUDA streams + eventos (cudaEventRecord/
+       cudaStreamWaitEvent), evitando qualquer stall da thread principal
+
+================================================================================
+4. PLANO DE IMPLEMENTAÇÃO POR FASES
+================================================================================
+
+FASE 1 — Corrigir fundação (curto prazo, bloqueante)
+------------------------------------------------------
+  [ ] Corrigir allocateSystemVirtual(): adicionar cudaHostRegister/unregister
+  [ ] Inicializar corretamente m_totalVirtualCapacity = VRAM + RAM (sem
+      pagefile)
+  [ ] Ligar os hooks de interceção (IAT hooking) ao TierManager::
+      decideTierAndAllocate() — atualmente desligado
+  [ ] Testes unitários: alocar/libertar em loop, validar sem memory leaks
+      (Application Verifier / CUDA-MEMCHECK)
+
+FASE 2 — Redesenhar o papel do Pagefile (médio prazo)
+--------------------------------------------------------
+  [ ] Remover o pagefile do cálculo de capacidade total reportada
+  [ ] Implementar SwapEngine com staging opcional em pagefile apenas para
+      transferências em lote/streaming
+  [ ] Garantir que, em steady state, nenhuma view do pagefile fica aberta
+      (auditoria via contagem de handles ativos)
+
+FASE 3 — Motor de Swap Inteligente (médio/longo prazo)
+------------------------------------------------------
+  [ ] Política de substituição (LRU / LFU / baseada em heurística de acesso
+      a camadas de modelo)
+  [ ] Prefetch preditivo para pipelines de inferência sequenciais (ComfyUI/
+      PyTorch: sabe-se a ordem das camadas antecipadamente)
+  [ ] Métricas de telemetria: taxa de swap, latência média de swap-in/out,
+      hit-rate de VRAM
+
+FASE 4 — Integração com PyTorch/ComfyUI
+--------------------------------------------
+  [ ] Extensão PyTorch via pybind11 para expor VirtualGpuMemory como
+      allocator customizado (caching allocator override)
+  [ ] Testes de carga real com modelos LTX-2.3 / Wan Video em VRAM de 12GB
+      com overflow controlado para RAM
+  [ ] Benchmark: throughput com e sem UMC ativo
+
+FASE 5 — Robustez e Produção
+--------------------------------
+  [ ] Tratamento de falhas: OOM em VRAM e RAM em simultâneo (fallback de
+      emergência, aí sim usando pagefile como último recurso "de verdade")
+  [ ] Logging/diagnóstico (níveis de tier por bloco, dump do mapa de
+      alocação)
+  [ ] Documentação final da API pública (VirtualGpuMemory)
+
+================================================================================
+5. RISCOS TÉCNICOS IDENTIFICADOS
+================================================================================
+
+  - Memória "pinned" em excesso pode degradar a performance geral do
+    sistema operativo (RAM pinned não é paginável pelo SO) — necessário
+    limite configurável de RAM pinned total.
+  - IAT hooking sobre cudaMalloc pode falhar silenciosamente se o
+    ComfyUI/PyTorch usar carregamento dinâmico tardio da CUDA runtime
+    (delay-loaded DLL) — validar ordem de carregamento.
+  - Interceção de kernel launches (necessária apenas se a Opção B fosse
+    escolhida) foi descartada na arquitetura atual, reduzindo
+    significativamente o risco de corrupção de memória.
+  - Concorrência: o registo std::unordered_map<size_t, BlockLocation>
+    precisa de proteção fina (lock por bloco ou sharding) para não se tornar
+    um gargalo com múltiplas threads de prefetch.
+
+================================================================================
+6. PRÓXIMO PASSO IMEDIATO
+================================================================================
+
+  1. Corrigir allocateSystemVirtual() (pinning CUDA)
+  2. Inicializar m_totalVirtualCapacity
+  3. Ligar o TierManager ao caminho dos hooks de interceção
+
+Estes três itens são bloqueantes para qualquer teste real da nova
+arquitetura RAM-como-extensão / Pagefile-como-cache.
+
+================================================================================
+FIM DO DOCUMENTO
+================================================================================

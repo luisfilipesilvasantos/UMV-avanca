@@ -1,0 +1,58 @@
+=== DIFERENÇAS ENTRE VirtualGpuMemory.cpp (ATUAL) E VirtualGpuMemory-Nemotron-Fixed.cpp ===
+
+1. CONSTRUTOR:
+--------------------------------------------------------------------------------
+O que o atual faz e Nemoton-Fixed NÃO faz:
+  - Inicializa m_pagefileLimitBytes(0) em vez de maxPagefileBudget
+  - Inicializa m_ramLimitBytes(0) em vez de maxRamBudget
+  - Inicializa m_globalAccessCounter, m_historyWindowSize, m_migrationHistoryWindowSize
+
+O que o Nemoton-Fixed faz e atual NÃO faz:
+  - Usa valores passados diretamente para inicializar m_pagefileLimitBytes/m_ramLimitBytes
+  - Não inicializa contadores de histórico (m_globalAccessCounter, etc.)
+
+Diferença de estilo/formatação:
+  - Nemoton-Fixed tem chaveta solta após '// Implementação' — erro de formatação grave
+
+2. INITIALIZE():
+--------------------------------------------------------------------------------
+O que o atual faz e Nemoton-Fixed NÃO faz:
+  - Calcula orçamentos reais (80% VRAM livre, 50% RAM disponível, pagefile limitado a min(256MB, availablePagefile/2))
+  - Cria streams CUDA por GPU via cudaStreamCreate() em m_streams
+  - Usa m_gpuAllocatedBytes.resize(deviceCount) para rastreamento por GPU
+  - Mensagens de log mais detalhadas (ex: "VRAM Total", "Host RAM Budget")
+
+O que o Nemoton-Fixed faz e atual NÃO faz:
+  - Usa valores passados diretamente para orçamentos, sem margem de segurança
+  - Não cria streams CUDA (perda crítica!)
+  - Mensagens de log mais simples (ex: "VRAM", "Free")
+
+3. CLEANUP():
+--------------------------------------------------------------------------------
+O que o atual faz e Nemoton-Fixed NÃO faz:
+  - Liberta m_systemAllocations (incluindo UnmapViewOfFile/CloseHandle para pagefile)
+  - Destroi streams CUDA com cudaStreamDestroy()
+  - Sincroniza streams antes de destruir (cudaStreamSynchronize)
+  - Limpa m_accessTimestamps, m_residencyHistory, m_migrationHistory
+
+O que o Nemoton-Fixed faz e atual NÃO faz:
+  - Só liberta m_blockMap — perda crítica de memória/handles se usar allocateSystemVirtual!
+  - Não limpa mapas de rastreamento (histórico)
+
+4. HEADERS:
+--------------------------------------------------------------------------------
+O atual usa: <nvml.h>, <cuda_runtime.h> — headers reais do CUDA Toolkit
+O Nemoton-Fixed usa: nvml_mock.h, cuda_runtime_mock.h — versões mockadas (sem GPU instalada)
+Conclusão: o ficheiro Nemoton-Fixed é uma variante 'modo desenvolvimento', não deve ser fundido com produção!
+
+5. PROBLEMAS IDENTIFICADOS NO FICHEIRO NEMOTON-FIXED:
+--------------------------------------------------------------------------------
+a) Chaveta solta (}) após comentário "// Implementação", antes do construtor — erro de sintaxe.
+b) CreateFile usa L"pagefile_mapping.dat" (wide string), que falha contra LPCSTR se UNICODE/_UNICODE não estiver definido — mesmo erro documentado em compile_errors.txt.
+
+6. PERDAS DE FUNCIONALIDADE NO NEMOTON-FIXED:
+--------------------------------------------------------------------------------
+- initialize() usa valores passados diretamente, sem cálculo real de orçamentos (80%/50%)
+- initialize() não cria streams CUDA por GPU (m_streams vazia)
+- cleanup() não liberta m_systemAllocations (leak de memória/handles para pagefile)
+- cleanup() não destroi streams CUDA
